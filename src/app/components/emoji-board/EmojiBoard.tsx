@@ -8,7 +8,7 @@ import React, {
   useCallback,
   useEffect,
   useMemo,
-  useRef,
+  useRef, useState
 } from 'react';
 import {
   Badge,
@@ -31,11 +31,10 @@ import FocusTrap from 'focus-trap-react';
 import { isKeyHotkey } from 'is-hotkey';
 import classNames from 'classnames';
 import { MatrixClient, Room } from 'matrix-js-sdk';
-import { atom, useAtomValue, useSetAtom } from 'jotai';
-import { useVirtualizer } from '@tanstack/react-virtual';
+import { defaultRangeExtractor, useVirtualizer, Range } from '@tanstack/react-virtual';
 
 import * as css from './EmojiBoard.css';
-import { EmojiGroupId, IEmoji, IEmojiGroup, emojiGroups, emojis } from '../../plugins/emoji';
+import { IEmoji, IEmojiGroup, emojiGroups, emojis } from '../../plugins/emoji';
 import { IEmojiGroupLabels, useEmojiGroupLabels } from './useEmojiGroupLabels';
 import { IEmojiGroupIcons, useEmojiGroupIcons } from './useEmojiGroupIcons';
 import { preventScrollWithArrowKey } from '../../utils/keyboard';
@@ -44,16 +43,13 @@ import { useMatrixClient } from '../../hooks/useMatrixClient';
 import { useRecentEmoji } from '../../hooks/useRecentEmoji';
 import { ExtendedPackImage, ImagePack, PackUsage } from '../../plugins/custom-emoji';
 import { isUserId } from '../../utils/matrix';
-import { editableActiveElement, isIntersectingScrollView, targetFromEvent } from '../../utils/dom';
+import { editableActiveElement, targetFromEvent } from '../../utils/dom';
 import { useAsyncSearch, UseAsyncSearchOptions, UseAsyncSearchResult } from '../../hooks/useAsyncSearch';
 import { useDebounce } from '../../hooks/useDebounce';
 import { useThrottle } from '../../hooks/useThrottle';
 import { addRecentEmoji } from '../../plugins/recent-emoji';
 import { mobileOrTablet } from '../../utils/user-agent';
 import { VirtualTile } from '../virtualizer';
-
-const RECENT_GROUP_ID = 'recent_group';
-const SEARCH_GROUP_ID = 'search_group';
 
 export enum EmojiBoardTab {
   Emoji = 'Emoji',
@@ -90,8 +86,6 @@ const getEmojiItemInfo = (element: Element): EmojiItemInfo | undefined => {
     };
   return undefined;
 };
-
-const activeGroupIdAtom = atom<string | undefined>(undefined);
 
 function Sidebar({ children }: { children: ReactNode }) {
   return (
@@ -204,7 +198,7 @@ function EmojiBoardTabs({
   );
 }
 
-export function SidebarBtn<T extends string>({
+function SidebarBtn<T extends string>({
   active,
   label,
   id,
@@ -244,7 +238,7 @@ export function SidebarBtn<T extends string>({
   );
 }
 
-export const EmojiGroup = as<
+const EmojiGroup = as<
   'div',
   {
     id: string;
@@ -272,7 +266,7 @@ export const EmojiGroup = as<
   </Box>
 ));
 
-export function EmojiItem({
+function EmojiItem({
   label,
   type,
   data,
@@ -303,7 +297,7 @@ export function EmojiItem({
   );
 }
 
-export function StickerItem({
+function StickerItem({
   label,
   type,
   data,
@@ -334,46 +328,81 @@ export function StickerItem({
   );
 }
 
-function RecentEmojiSidebarStack({ onItemClick }: { onItemClick: (id: string) => void }) {
-  const activeGroupId = useAtomValue(activeGroupIdAtom);
+// TODO: move to own file
 
+interface VirtualizedItem<T> { key: () => string, size: () => number, item: T }
+
+const virtualizedItemVirtualizerOptions = <T,>(items: VirtualizedItem<T>[]) => ({
+  estimateSize: (i: number) => items[i].size(),
+  getItemKey: (i: number) => items[i].key(),
+});
+
+interface SearchResultItem { kind: "search", result: UseAsyncSearchResult<ExtendedPackImage | IEmoji> }
+interface RecentItem { kind: "recent" }
+interface CustomPackItem { kind: "custom", pack: ImagePack }
+interface StickerPackItem { kind: "sticker", pack: ImagePack }
+interface NativeGroupItem { kind: "native", emojiGroup: IEmojiGroup }
+type EmojiBoardItem = SearchResultItem | RecentItem | CustomPackItem | StickerPackItem | NativeGroupItem
+
+function emojiBoardItemId(item: EmojiBoardItem) {
+  switch (item.kind) {
+    case "search": return "search";
+    case "recent": return "recent";
+    case "custom": return `custom-${item.pack.id}`;
+    case "sticker": return `sticker-${item.pack.id}`;
+    case "native": return `native-${item.emojiGroup.id}`;
+    default:
+  }
+  return item; // unreachable (item has type never)
+}
+
+// TODO: memo?
+function RecentEmojiSidebarStack({ activeId, onItemClick }: { activeId: string, onItemClick: (id: string) => void }) {
+  const recentId = emojiBoardItemId({ kind: "recent" });
   return (
     <SidebarStack>
       <SidebarBtn
-        active={activeGroupId === RECENT_GROUP_ID}
-        id={RECENT_GROUP_ID}
+        active={activeId === recentId}
+        id={recentId}
         label="Recent"
-        onItemClick={() => onItemClick(RECENT_GROUP_ID)}
+        onItemClick={() => onItemClick(recentId)}
       >
-        <Icon src={Icons.RecentClock} filled={activeGroupId === RECENT_GROUP_ID} />
+        <Icon src={Icons.RecentClock} filled={activeId === recentId} />
       </SidebarBtn>
     </SidebarStack>
   );
 }
 
+// TODO: memo?
 function ImagePackSidebarStack({
   mx,
   packs,
+  activeId,
   usage,
   onItemClick,
 }: {
   mx: MatrixClient;
   packs: ImagePack[];
+  activeId: string;
   usage: PackUsage;
   onItemClick: (id: string) => void;
 }) {
-  const activeGroupId = useAtomValue(activeGroupIdAtom);
+  // const activeGroupId = useAtomValue(activeGroupIdAtom);
   return (
     <SidebarStack>
       {usage === PackUsage.Emoticon && <SidebarDivider />}
       {packs.map((pack) => {
         let label = pack.displayName;
         if (!label) label = isUserId(pack.id) ? 'Personal Pack' : mx.getRoom(pack.id)?.name;
+        const packItemId = emojiBoardItemId({
+          kind: (usage === PackUsage.Emoticon ? "custom" : "sticker"),
+          pack,
+        });
         return (
           <SidebarBtn
-            active={activeGroupId === pack.id}
-            key={pack.id}
-            id={pack.id}
+            active={activeId === packItemId}
+            key={packItemId}
+            id={packItemId}
             label={label || 'Unknown Pack'}
             onItemClick={onItemClick}
           >
@@ -393,36 +422,42 @@ function ImagePackSidebarStack({
   );
 }
 
+// TODO: memo?
 function NativeEmojiSidebarStack({
   groups,
   icons,
+  activeId,
   labels,
   onItemClick,
 }: {
   groups: IEmojiGroup[];
   icons: IEmojiGroupIcons;
+  activeId: string;
   labels: IEmojiGroupLabels;
-  onItemClick: (id: EmojiGroupId) => void;
+  onItemClick: (id: string) => void;
 }) {
-  const activeGroupId = useAtomValue(activeGroupIdAtom);
   return (
     <SidebarStack className={css.NativeEmojiSidebarStack}>
       <SidebarDivider />
-      {groups.map((group) => (
-        <SidebarBtn
-          key={group.id}
-          active={activeGroupId === group.id}
-          id={group.id}
-          label={labels[group.id]}
-          onItemClick={onItemClick}
-        >
-          <Icon src={icons[group.id]} filled={activeGroupId === group.id} />
-        </SidebarBtn>
-      ))}
+      {groups.map((group) => {
+        const groupItemId = emojiBoardItemId({ kind: "native", emojiGroup: group });
+        return (
+          <SidebarBtn
+            key={groupItemId}
+            active={activeId === groupItemId}
+            id={groupItemId}
+            label={labels[group.id]}
+            onItemClick={onItemClick}
+          >
+            <Icon src={icons[group.id]} filled={activeId === groupItemId} />
+          </SidebarBtn>
+        );
+      })}
     </SidebarStack>
   );
 }
 
+// TODO: memo?
 export function RecentEmojiGroup({
   label,
   id,
@@ -449,7 +484,8 @@ export function RecentEmojiGroup({
   );
 }
 
-export function SearchEmojiGroup({
+// TODO: memo?
+function SearchEmojiGroup({
   mx,
   tab,
   label,
@@ -515,35 +551,8 @@ export function SearchEmojiGroup({
   );
 }
 
-// export const CustomEmojiGroups = memo(
-//   ({ mx, groups }: { mx: MatrixClient; groups: ImagePack[] }) => (
-//     <>
-//       {groups.map((pack) => (
-//         <EmojiGroup key={pack.id} id={pack.id} label={pack.displayName || 'Unknown'}>
-//           {pack.getEmojis().map((image) => (
-//             <EmojiItem
-//               key={image.shortcode}
-//               label={image.body || image.shortcode}
-//               type={EmojiType.CustomEmoji}
-//               data={image.url}
-//               shortcode={image.shortcode}
-//             >
-//               <img
-//                 loading="lazy"
-//                 className={css.CustomEmojiImg}
-//                 alt={image.body || image.shortcode}
-//                 src={mx.mxcUrlToHttp(image.url) ?? image.url}
-//               />
-//             </EmojiItem>
-//           ))}
-//         </EmojiGroup>
-//       ))}
-//     </>
-//   )
-// );
-
 const CustomEmojiGroup = memo(
-  ({ mx, pack }: { mx: MatrixClient; pack: ImagePack }) => (
+  ({ mx, pack }: { mx: MatrixClient; pack: ImagePack }) =>
     <EmojiGroup key={pack.id} id={pack.id} label={pack.displayName || 'Unknown'}>
       {pack.getEmojis().map((image) => (
         <EmojiItem
@@ -564,52 +573,10 @@ const CustomEmojiGroup = memo(
         </EmojiItem>
       ))}
     </EmojiGroup>
-));
-
-// export const StickerGroups = memo(({ mx, groups }: { mx: MatrixClient; groups: ImagePack[] }) => (
-//   <>
-//     {groups.length === 0 && (
-//       <Box
-//         style={{ padding: `${toRem(60)} ${config.space.S500}` }}
-//         alignItems="Center"
-//         justifyContent="Center"
-//         direction="Column"
-//         gap="300"
-//       >
-//         <Icon size="600" src={Icons.Sticker} />
-//         <Box direction="Inherit">
-//           <Text align="Center">No Sticker Packs!</Text>
-//           <Text priority="300" align="Center" size="T200">
-//             Add stickers from user, room or space settings.
-//           </Text>
-//         </Box>
-//       </Box>
-//     )}
-//     {groups.map((pack) => (
-//       <EmojiGroup key={pack.id} id={pack.id} label={pack.displayName || 'Unknown'}>
-//         {pack.getStickers().map((image) => (
-//           <StickerItem
-//             key={image.shortcode}
-//             label={image.body || image.shortcode}
-//             type={EmojiType.Sticker}
-//             data={image.url}
-//             shortcode={image.shortcode}
-//           >
-//             <img
-//               loading="lazy"
-//               className={css.StickerImg}
-//               alt={image.body || image.shortcode}
-//               src={mx.mxcUrlToHttp(image.url) ?? image.url}
-//             />
-//           </StickerItem>
-//         ))}
-//       </EmojiGroup>
-//     ))}
-//   </>
-// ));
+);
 
 const StickerGroup = memo(
-  ({ mx, pack }: { mx: MatrixClient, pack: ImagePack }) => (
+  ({ mx, pack }: { mx: MatrixClient, pack: ImagePack }) =>
     <EmojiGroup key={pack.id} id={pack.id} label={pack.displayName || 'Unknown'}>
       {pack.getStickers().map((image) => (
         <StickerItem
@@ -628,7 +595,25 @@ const StickerGroup = memo(
         </StickerItem>
       ))}
     </EmojiGroup>
-  )
+);
+
+const NoStickers = memo(
+  () =>
+    <Box
+      style={{ padding: `${toRem(60)} ${config.space.S500}` }}
+      alignItems="Center"
+      justifyContent="Center"
+      direction="Column"
+      gap="300"
+    >
+      <Icon size="600" src={Icons.Sticker} />
+      <Box direction="Inherit">
+        <Text align="Center">No Sticker Packs!</Text>
+        <Text priority="300" align="Center" size="T200">
+          Add stickers from user, room or space settings.
+        </Text>
+      </Box>
+    </Box>
 );
 
 const NativeEmojiGroup = memo(
@@ -648,41 +633,6 @@ const NativeEmojiGroup = memo(
     </EmojiGroup>
 );
 
-// export function NativeEmojiGroups1() {/*memo(*/
-//   // () => {
-//   // ({ groups, labels }: { groups: IEmojiGroup[]; labels: IEmojiGroupLabels }) => {
-//
-//     const groups = emojiGroups;
-//     const labels = emojiGroupLabels;
-//
-//     console.log("re-render native emoji groups");
-//     return (
-//       <>
-//         {/* taking only the first 10 emoji from each group is fast */}
-//         {groups.map((emojiGroup) => (
-//           <EmojiGroup key={emojiGroup.id} id={emojiGroup.id} label={labels[emojiGroup.id]}>
-//             {emojiGroup.emojis /*.slice(0, 10)*/ .map((emoji) => (
-//               // <Text align="Center" key={emoji.unicode}>meow</Text>
-//               <EmojiItem
-//                 key={emoji.unicode}
-//                 label={emoji.label}
-//                 type={EmojiType.Emoji}
-//                 data={emoji.unicode}
-//                 shortcode={emoji.shortcode}
-//               >
-//                 {emoji.unicode}
-//               </EmojiItem>
-//             ))}
-//           </EmojiGroup>
-//         ))}
-//       </>
-//     );
-//
-//   }
-/*, () => {console.log("Memo check"); return true;});*/
-
-// export const NativeEmojiGroups = memo(NativeEmojiGroups1);
-
 const getSearchListItemStr = (item: ExtendedPackImage | IEmoji) => {
   const shortcode = `:${item.shortcode}:`;
   if ('body' in item) {
@@ -696,15 +646,6 @@ const SEARCH_OPTIONS: UseAsyncSearchOptions = {
     contain: true,
   },
 };
-
-// TODO: move to own file
-
-interface VirtualizedItem<T> { key: () => string, size: () => number, item: T }
-
-const virtualizedItemVirtualizerOptions = <T,>(items: VirtualizedItem<T>[]) => ({
-  estimateSize: (i: number) => items[i].size(),
-  getItemKey: (i: number) => items[i].key(),
-});
 
 export function EmojiBoard({
   tab = EmojiBoardTab.Emoji,
@@ -733,7 +674,6 @@ export function EmojiBoard({
   const stickerTab = tab === EmojiBoardTab.Sticker;
   const usage = emojiTab ? PackUsage.Emoticon : PackUsage.Sticker;
 
-  const setActiveGroupId = useSetAtom(activeGroupIdAtom);
   const mx = useMatrixClient();
   const emojiGroupLabels = useEmojiGroupLabels();
   const emojiGroupIcons = useEmojiGroupIcons();
@@ -768,25 +708,6 @@ export function EmojiBoard({
     ),
     { wait: 200 }
   );
-
-  const syncActiveGroupId = useCallback(() => {
-    const targetEl = contentScrollRef.current;
-    if (!targetEl) return;
-    const groupEls = [...targetEl.querySelectorAll('div[data-group-id]')] as HTMLElement[];
-    const groupEl = groupEls.find((el) => isIntersectingScrollView(targetEl, el));
-    const groupId = groupEl?.getAttribute('data-group-id') ?? undefined;
-    setActiveGroupId(groupId);
-  }, [setActiveGroupId]);
-
-  const handleOnScroll: UIEventHandler<HTMLDivElement> = useThrottle(syncActiveGroupId, {
-    wait: 100,
-  });
-
-  const handleScrollToGroup = (groupId: string) => {
-    setActiveGroupId(groupId);
-    const groupElement = document.getElementById(getDOMGroupId(groupId));
-    groupElement?.scrollIntoView();
-  };
 
   const handleEmojiClick: MouseEventHandler = (evt) => {
     const targetEl = targetFromEvent(evt.nativeEvent, 'button');
@@ -845,86 +766,85 @@ export function EmojiBoard({
     handleEmojiPreview(targetEl);
   };
 
-  // Reset scroll top on search and tab change
-  useEffect(() => {
-    syncActiveGroupId();
-    contentScrollRef.current?.scrollTo({
-      top: 0,
-    });
-  }, [result, emojiTab, syncActiveGroupId]);
-
-  // console.log("return EmojiBoard", "emojiGroups length:", emojiGroups.length);
-  // const groupParentRef = useRef<Element>(null);
-
-  interface SearchGroup { kind: "search", result: UseAsyncSearchResult<ExtendedPackImage | IEmoji> }
-  interface RecentGroup { kind: "recent" }
-  interface CustomGroup { kind: "custom", pack: ImagePack }
-  interface StickerGroup2 { kind: "sticker", pack: ImagePack }
-  interface NativeGroup { kind: "native", emojiGroup: IEmojiGroup }
-  type Group = SearchGroup | RecentGroup | CustomGroup | StickerGroup2 | NativeGroup
-
   const emojiGroupSize = (n: number) => 64 + 48 * Math.ceil(n / 7); // TODO: no hard-coding...
   const stickerGroupSize = (n: number) => 64 + 112 * Math.ceil(n / 3);
 
   const groups = useMemo(() => {
-    const groupsM: VirtualizedItem<Group>[] = [];
+    const groupsM: VirtualizedItem<EmojiBoardItem>[] = [];
+    
+    const vItem = (size: () => number, item: EmojiBoardItem): VirtualizedItem<EmojiBoardItem> => ({
+      size,
+      key: () => emojiBoardItemId(item),
+      item,
+    });
 
     if (result)
-      groupsM.push({
-        size: () => (emojiTab ? emojiGroupSize : stickerGroupSize)(result.items.length), // TODO: zero results case
-        key: () => "search",
-        item: { kind: "search", result },
-      });
+      groupsM.push(vItem(
+        () => (emojiTab ? emojiGroupSize : stickerGroupSize)(result.items.length),
+        { kind: "search", result },
+      ));
 
     if (emojiTab) {
 
       if (recentEmojis.length > 0)
-        groupsM.push({
-          size: () => emojiGroupSize(recentEmojis.length),
-          key: () => "recent",
-          item: { kind: "recent" },
-        });
+        groupsM.push(vItem(
+          () => emojiGroupSize(recentEmojis.length),
+          { kind: "recent" },
+        ));
 
       imagePacks.forEach((pack: ImagePack) => {
-        groupsM.push({
-          size: () => emojiGroupSize(pack.emoticons.length),
-          key: () => `custom-${pack.id}`,
-          item: { kind: "custom", pack },
-        });
+        groupsM.push(vItem(
+          () => emojiGroupSize(pack.emoticons.length),
+          { kind: "custom", pack },
+        ));
       });
 
       emojiGroups.forEach((emojiGroup) => {
-        groupsM.push({
-          size: () => emojiGroupSize(emojiGroup.emojis.length),
-          key: () => `native-${emojiGroup.id}`,
-          item: { kind: "native", emojiGroup },
-        });
+        groupsM.push(vItem(
+          () => emojiGroupSize(emojiGroup.emojis.length),
+          { kind: "native", emojiGroup },
+        ));
       });
     }
 
     if (stickerTab) {
       imagePacks.forEach((pack: ImagePack) => {
-        groupsM.push({
-          size: () => stickerGroupSize(pack.stickers.length),
-          key: () => `sticker-${pack.id}`,
-          item: { kind: "sticker", pack },
-        });
+        groupsM.push(vItem(
+          () => stickerGroupSize(pack.stickers.length),
+          { kind: "sticker", pack },
+        ));
       });
     }
 
     return groupsM;
   }, [result, recentEmojis, emojiTab, imagePacks, stickerTab]);
 
-  // TODO: is this useCallback necessary?
-  const getScrollElement = useCallback(() => contentScrollRef.current, []);
+  const [firstVisibleItemId, setFirstVisibleItemId] = useState<string>("");
 
-  const groupRowVirtualizer = useVirtualizer({
+  const itemVirtualizer = useVirtualizer({
     ...virtualizedItemVirtualizerOptions(groups),
     count: groups.length,
-    getScrollElement,
-    overscan: 2,
-    // TODO: scrollToFn (???) -> scroll spy for sidebar; sidebar scrollTo
+    getScrollElement: useCallback(() => contentScrollRef.current, []),
+    overscan: 1,
+    rangeExtractor: useCallback((range: Range) => {
+      const k = groups[range.startIndex].key();
+      if (k !== firstVisibleItemId)
+        setFirstVisibleItemId(k);
+      return defaultRangeExtractor(range);
+    }, [groups, firstVisibleItemId, setFirstVisibleItemId]),
   });
+
+  const handleScrollToItem = useCallback((itemId: string) => {
+    const targetItemIndex = groups.findIndex(({ key }) => key() === itemId);
+    itemVirtualizer.scrollToIndex(targetItemIndex, { align: "start" });
+  }, [groups, itemVirtualizer]);
+
+  // scroll to top when changing tabs
+  const [prevTab, setPrevTab] = useState(tab);
+  if (tab !== prevTab) {
+    setPrevTab(tab);
+    itemVirtualizer.scrollToOffset(0, { align: "start" });
+  }
 
   const res = (
     <FocusTrap
@@ -983,7 +903,7 @@ export function EmojiBoard({
         sidebar={
           <Sidebar>
             {emojiTab && recentEmojis.length > 0 && (
-              <RecentEmojiSidebarStack onItemClick={handleScrollToGroup} />
+              <RecentEmojiSidebarStack activeId={firstVisibleItemId} onItemClick={handleScrollToItem} />
             )}
             {/* TODO: could be virtualized too, but perf is OK without */}
             {imagePacks.length > 0 && (
@@ -991,15 +911,17 @@ export function EmojiBoard({
                 mx={mx}
                 usage={usage}
                 packs={imagePacks}
-                onItemClick={handleScrollToGroup}
+                activeId={firstVisibleItemId}
+                onItemClick={handleScrollToItem}
               />
             )}
             {emojiTab && (
               <NativeEmojiSidebarStack
                 groups={emojiGroups}
                 icons={emojiGroupIcons}
+                activeId={firstVisibleItemId}
                 labels={emojiGroupLabels}
-                onItemClick={handleScrollToGroup}
+                onItemClick={handleScrollToItem}
               />
             )}
           </Sidebar>
@@ -1035,7 +957,7 @@ export function EmojiBoard({
           <Scroll
             ref={contentScrollRef}
             size="400"
-            onScroll={handleOnScroll}
+            // onScroll={handleOnScroll}
             onKeyDown={preventScrollWithArrowKey}
             hideTrack
           >
@@ -1047,35 +969,36 @@ export function EmojiBoard({
               gap="200"
               // TODO: height on Box OK?
               style={{
-                height: `${groupRowVirtualizer.getTotalSize()}px`,
+                height: `${itemVirtualizer.getTotalSize()}px`,
                 // width: '100%',
                 position: 'relative',
               }}
             >
-              {groupRowVirtualizer.getVirtualItems().map((virtualRow) => {
-                const group = groups[virtualRow.index].item;
+              {stickerTab && imagePacks.length === 0 && <NoStickers />}
+              {itemVirtualizer.getVirtualItems().map((virtualRow) => {
+                const { item, key } = groups[virtualRow.index];
 
                 let component;
-                if (group.kind === "search")
+                if (item.kind === "search")
                   component = (
                     <SearchEmojiGroup
                       mx={mx}
                       tab={tab}
-                      id={SEARCH_GROUP_ID}
-                      label={group.result.items.length ? 'Search Results' : 'No Results found'}
-                      emojis={group.result.items}
+                      id={key()}
+                      label={item.result.items.length ? 'Search Results' : 'No Results found'}
+                      emojis={item.result.items}
                     />)
-                else if (group.kind === "recent")
-                  component = <RecentEmojiGroup id={RECENT_GROUP_ID} label="Recent" emojis={recentEmojis} />;
-                else if (group.kind === "custom")
-                  component = <CustomEmojiGroup mx={mx} pack={group.pack} />;
-                else if (group.kind === "sticker")
-                  component = <StickerGroup mx={mx} pack={group.pack} />;
-                else if (group.kind === "native")
+                else if (item.kind === "recent")
+                  component = <RecentEmojiGroup id={key()} label="Recent" emojis={recentEmojis} />;
+                else if (item.kind === "custom")
+                  component = <CustomEmojiGroup mx={mx} pack={item.pack} />;
+                else if (item.kind === "sticker")
+                  component = <StickerGroup mx={mx} pack={item.pack} />;
+                else if (item.kind === "native")
                   component = (
                     <NativeEmojiGroup
-                      emojiGroup={group.emojiGroup}
-                      emojiGroupLabel={emojiGroupLabels[group.emojiGroup.id]}
+                      emojiGroup={item.emojiGroup}
+                      emojiGroupLabel={emojiGroupLabels[item.emojiGroup.id]}
                     />);
 
                 return (<VirtualTile key={virtualRow.key} virtualItem={virtualRow}>{ component }</VirtualTile>);
