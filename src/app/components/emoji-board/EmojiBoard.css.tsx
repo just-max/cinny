@@ -1,6 +1,20 @@
 import { style } from '@vanilla-extract/css';
 import { DefaultReset, FocusOutline, color, config, toRem } from 'folds';
 
+// pre-define some dimensions so we can refer to them to size virtualized components
+export const styleParams = {
+  emojiItemHeight: 48,
+  emojiItemWidth: 48,
+  stickerItemHeight: 112,
+  stickerItemWidth: 112,
+
+  // this is hard-coded based on the size of an emoji group label and padding,
+  // since it cannot be read directly from `config`
+  groupExtraHeight: 56,
+};
+
+Object.freeze(styleParams);
+
 export const Base = style({
   maxWidth: toRem(432),
   width: `calc(100vw - 2 * ${config.space.S400})`,
@@ -96,8 +110,8 @@ export const EmojiItem = style([
   DefaultReset,
   FocusOutline,
   {
-    width: toRem(48),
-    height: toRem(48),
+    width: toRem(styleParams.emojiItemWidth),
+    height: toRem(styleParams.emojiItemHeight),
     fontSize: toRem(32),
     lineHeight: toRem(32),
     borderRadius: config.radii.R400,
@@ -112,8 +126,8 @@ export const EmojiItem = style([
 export const StickerItem = style([
   EmojiItem,
   {
-    width: toRem(112),
-    height: toRem(112),
+    width: toRem(styleParams.stickerItemWidth),
+    height: toRem(styleParams.stickerItemHeight),
   },
 ]);
 
